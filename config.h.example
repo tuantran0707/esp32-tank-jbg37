@@ -1,0 +1,56 @@
+#pragma once
+
+// Sao chép file này thành config.h rồi điền WiFi / ThingsBoard token
+
+#define WIFI_SSID     "YOUR_WIFI"
+#define WIFI_PASSWORD "YOUR_PASSWORD"
+#define TB_SERVER     "thingsboard.cloud"
+#define TB_PORT       1883
+#define TB_TOKEN      "YOUR_THINGSBOARD_TOKEN"
+
+#define PIN_MOTOR_R_PWM 27
+#define PIN_MOTOR_R_IN1 26
+#define PIN_MOTOR_R_IN2 25
+#define PIN_MOTOR_L_PWM 13
+#define PIN_MOTOR_L_IN1 33
+#define PIN_MOTOR_L_IN2 32
+
+#define PIN_ENC_R_C1 12
+#define PIN_ENC_R_C2 14
+#define PIN_ENC_L_C1 35
+#define PIN_ENC_L_C2 34
+
+#define PIN_BUZZER 15
+#define PIN_GAS    36
+
+#define MOTOR_R_SIGN  1
+#define MOTOR_L_SIGN -1
+#define ENC_R_SIGN    1
+#define ENC_L_SIGN   -1
+
+#define PWM_FREQ_HZ   20000
+#define PWM_RES_BITS  8
+#define PWM_MAX       255
+#define MAX_PWM_DUTY  180
+#define TURN_PWM_LEFT   165
+#define TURN_PWM_RIGHT  120
+#define TURN_PWM_DUTY   TURN_PWM_LEFT
+
+#define DEFAULT_COUNTS_PER_CM  58.0f
+#define DEFAULT_TURN_90_COUNTS 1650L
+#define DEFAULT_SCAN_360_MS    1700UL
+
+#define MAP_SIZE_CM 150
+
+#define TELEMETRY_INTERVAL_MS    3000UL
+#define ATTR_REQUEST_INTERVAL_MS 15000UL
+#define TIME_SYNC_INTERVAL_MS    3600000UL
+#define GAS_SCAN_SAMPLE_MS       200UL
+#define GAS_ALERT_THRESHOLD      700
+
+#define TB_SHARED_KEYS \
+  "mode,x,y,duration,stop," \
+  "auto_enabled,target_x,target_y,run_at_epoch,auto_start_now," \
+  "counts_per_cm,turn_90_counts,scan_360_ms"
+
+#define SCHEDULE_FILE "/auto_schedule.json"
