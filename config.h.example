@@ -36,9 +36,21 @@
 #define TURN_PWM_RIGHT  120
 #define TURN_PWM_DUTY   TURN_PWM_LEFT
 
-#define DEFAULT_COUNTS_PER_CM  58.0f
-#define DEFAULT_TURN_90_COUNTS 1650L
+// Hieu chuan tam (motor_test phim m, 90cm): trimF=12 trimR=0 counts/cm=103.0
+#define STRAIGHT_FWD_RIGHT_TRIM  12
+#define STRAIGHT_REV_LEFT_TRIM   0
+
+#define DEFAULT_COUNTS_PER_CM  103.0f
+// 1470 thieu ~3-4° → tang them ~60 counts (~1530 ≈ 93°)
+#define DEFAULT_TURN_90_COUNTS 1530L
 #define DEFAULT_SCAN_360_MS    1700UL
+
+// Timeout bước tiến thẳng (auto): khớp motor_test phím m
+#define STRAIGHT_STEP_TIMEOUT_MS_PER_CM  95
+#define STRAIGHT_STEP_TIMEOUT_EXTRA_MS   2000
+
+#define PATH_COMP_Y_CM  15
+#define PATH_COMP_X_CM -15
 
 #define MAP_SIZE_CM 150
 
@@ -51,6 +63,7 @@
 #define TB_SHARED_KEYS \
   "mode,x,y,duration,stop," \
   "auto_enabled,target_x,target_y,run_at_epoch,auto_start_now," \
+  "map_size,map_size_x,map_size_y," \
   "counts_per_cm,turn_90_counts,scan_360_ms"
 
 #define SCHEDULE_FILE "/auto_schedule.json"

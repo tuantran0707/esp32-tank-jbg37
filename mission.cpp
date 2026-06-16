@@ -1,5 +1,17 @@
 #include "mission.h"
 
+#ifndef STRAIGHT_STEP_TIMEOUT_MS_PER_CM
+#define STRAIGHT_STEP_TIMEOUT_MS_PER_CM 95
+#define STRAIGHT_STEP_TIMEOUT_EXTRA_MS  2000
+#endif
+
+#ifndef PATH_COMP_Y_CM
+#define PATH_COMP_Y_CM  15
+#endif
+#ifndef PATH_COMP_X_CM
+#define PATH_COMP_X_CM -15
+#endif
+
 MissionController::MissionController()
     : motors_(nullptr),
       odom_(nullptr),
@@ -10,6 +22,8 @@ MissionController::MissionController()
       countsPerCm_(DEFAULT_COUNTS_PER_CM),
       turn90Counts_(DEFAULT_TURN_90_COUNTS),
       scan360Ms_(DEFAULT_SCAN_360_MS),
+      mapSizeX_(MAP_SIZE_CM),
+      mapSizeY_(MAP_SIZE_CM),
       queueCount_(0),
       queueIndex_(0),
       stepRunning_(false),
@@ -17,15 +31,11 @@ MissionController::MissionController()
       stepStartEncR_(0),
       stepStartEncL_(0),
       missionActive_(false),
-      scanRunning_(false),
-      scanStartedAt_(0),
-      lastGasSampleAt_(0),
-      scanPeakGas_(-1),
-      scanPeakAngle_(0),
       manualX_(0),
       manualY_(0),
       manualAutoStop_(false),
-      manualStopAt_(0) {}
+      manualStopAt_(0),
+      manualEncMoveActive_(false) {}
 
 void MissionController::begin(TankMotors* motors, Odometry* odom) {
   motors_ = motors;
@@ -42,6 +52,19 @@ void MissionController::setCalibration(float countsPerCm, long turn90Counts, uin
   }
 }
 
+void MissionController::applyStraightTrim(int& left, int& right) const {
+  if (left > 0 && right > 0 && left == right) {
+    right = constrain(right - STRAIGHT_FWD_RIGHT_TRIM, 0, MAX_PWM_DUTY);
+  } else if (left < 0 && right < 0 && left == right) {
+    left = constrain(left + STRAIGHT_REV_LEFT_TRIM, -MAX_PWM_DUTY, 0);
+  }
+}
+
+void MissionController::setMapSize(int sizeX, int sizeY) {
+  mapSizeX_ = constrain(sizeX, 10, 500);
+  mapSizeY_ = constrain(sizeY, 10, 500);
+}
+
 void MissionController::setMode(ControlMode mode) {
   mode_ = mode;
   if (mode_ == MODE_MANUAL) cancelAuto();
@@ -54,11 +77,40 @@ void MissionController::setAutoConfig(const AutoConfig& cfg) {
 void MissionController::driveXY(int x, int y) {
   x = constrain(x, -100, 100);
   y = constrain(y, -100, 100);
-  const int left  = (constrain(x + y, -100, 100) * MAX_PWM_DUTY) / 100;
-  const int right = (constrain(x - y, -100, 100) * MAX_PWM_DUTY) / 100;
+  // y = tien/lui, x = xoay: trai = y+x, phai = y-x
+  int left  = (constrain(y + x, -100, 100) * MAX_PWM_DUTY) / 100;
+  int right = (constrain(y - x, -100, 100) * MAX_PWM_DUTY) / 100;
+  applyStraightTrim(left, right);
   motors_->setDuties(left, right);
   manualX_ = x;
   manualY_ = y;
+  manualEncMoveActive_ = false;
+}
+
+void MissionController::startManualMoveTo(int targetX, int targetY) {
+  targetX = constrain(targetX, 0, mapSizeX_);
+  targetY = constrain(targetY, 0, mapSizeY_);
+
+  if (targetX == pose_.x && targetY == pose_.y) {
+    return;
+  }
+
+  motors_->stop();
+  manualX_ = 0;
+  manualY_ = 0;
+  manualAutoStop_ = false;
+  queueClear();
+  stepRunning_ = false;
+  manualEncMoveActive_ = true;
+  queuePathTo(targetX, targetY);
+}
+
+void MissionController::processManualEncMove(unsigned long nowMs) {
+  if (!manualEncMoveActive_) return;
+  if (processQueue(nowMs)) {
+    manualEncMoveActive_ = false;
+    stopAll();
+  }
 }
 
 void MissionController::setManualDurationMs(int durationMs, unsigned long nowMs) {
@@ -75,12 +127,13 @@ void MissionController::stopAll() {
   manualX_ = 0;
   manualY_ = 0;
   manualAutoStop_ = false;
+  manualEncMoveActive_ = false;
   stepRunning_ = false;
+  queueClear();
 }
 
 void MissionController::cancelAuto() {
   missionActive_ = false;
-  scanRunning_ = false;
   queueClear();
   autoState_ = AUTO_DISABLED;
   stopAll();
@@ -120,8 +173,23 @@ void MissionController::queueTurnTo(Heading target) {
 
 void MissionController::queueAddForwardCm(int cm) {
   if (cm <= 0) return;
-  const long encTarget = (long)(cm * countsPerCm_);
-  const uint32_t timeout = (uint32_t)(cm * 80 + 500);
+
+  int driveCm = cm;
+  switch (pose_.heading) {
+    case HEAD_NORTH:
+    case HEAD_SOUTH:
+      driveCm = cm + PATH_COMP_Y_CM;
+      break;
+    case HEAD_EAST:
+    case HEAD_WEST:
+      driveCm = cm + PATH_COMP_X_CM;
+      break;
+  }
+  if (driveCm < 1) driveCm = 1;
+
+  const long encTarget = (long)(driveCm * countsPerCm_);
+  const uint32_t timeout = (uint32_t)(driveCm * STRAIGHT_STEP_TIMEOUT_MS_PER_CM
+                                      + STRAIGHT_STEP_TIMEOUT_EXTRA_MS);
 
   int dx = 0, dy = 0;
   switch (pose_.heading) {
@@ -130,16 +198,23 @@ void MissionController::queueAddForwardCm(int cm) {
     case HEAD_SOUTH: dy = -cm; break;
     case HEAD_WEST:  dx = -cm; break;
   }
-  queuePush(MAX_PWM_DUTY, MAX_PWM_DUTY, encTarget, false, timeout, dx, dy, 0);
+  int leftDuty = MAX_PWM_DUTY;
+  int rightDuty = MAX_PWM_DUTY;
+  applyStraightTrim(leftDuty, rightDuty);
+  queuePush(leftDuty, rightDuty, encTarget, false, timeout, dx, dy, 0);
 }
 
 void MissionController::queuePathTo(int dstX, int dstY) {
   queueClear();
   const Pose saved = pose_;
 
+  dstX = constrain(dstX, 0, mapSizeX_);
+  dstY = constrain(dstY, 0, mapSizeY_);
+
   const int dx = dstX - pose_.x;
   const int dy = dstY - pose_.y;
 
+  // Manhattan: Y trước (0,0→0,100), rồi X (0,100→100,100)
   if (dy > 0) {
     queueTurnTo(HEAD_NORTH);
     pose_.heading = HEAD_NORTH;
@@ -168,8 +243,8 @@ void MissionController::queuePathTo(int dstX, int dstY) {
 }
 
 void MissionController::applyStepToPose(const MotionStep& step) {
-  pose_.x = constrain(pose_.x + step.deltaX, 0, MAP_SIZE_CM);
-  pose_.y = constrain(pose_.y + step.deltaY, 0, MAP_SIZE_CM);
+  pose_.x = constrain(pose_.x + step.deltaX, 0, mapSizeX_);
+  pose_.y = constrain(pose_.y + step.deltaY, 0, mapSizeY_);
   const int hd = ((int)pose_.heading + step.deltaHeading + 4) % 4;
   pose_.heading = (Heading)hd;
 }
@@ -201,7 +276,7 @@ bool MissionController::processQueue(unsigned long nowMs) {
   if (stepRunning_) {
     const MotionStep& st = queue_[queueIndex_];
     if (encoderStepDone(st) || (long)(nowMs - stepEndsAt_) >= 0) {
-      stopAll();
+      motors_->stop();
       applyStepToPose(st);
       queueIndex_++;
       stepRunning_ = false;
@@ -217,18 +292,15 @@ void MissionController::startAutoNow() {
   autoState_ = AUTO_MOVING_TO_TARGET;
   pose_ = {0, 0, HEAD_NORTH};
   odom_->resetCounts();
-  queuePathTo(constrain(autoCfg_.targetX, 0, MAP_SIZE_CM),
-              constrain(autoCfg_.targetY, 0, MAP_SIZE_CM));
+  queuePathTo(constrain(autoCfg_.targetX, 0, mapSizeX_),
+              constrain(autoCfg_.targetY, 0, mapSizeY_));
 }
 
-void MissionController::beginGasScan(unsigned long nowMs) {
-  scanRunning_ = true;
-  scanStartedAt_ = nowMs;
-  lastGasSampleAt_ = 0;
-  scanPeakGas_ = -1;
-  scanPeakAngle_ = 0;
-  motors_->setDuties(TURN_PWM_DUTY, -TURN_PWM_DUTY);
-  autoState_ = AUTO_SCANNING_GAS;
+void MissionController::finishMissionAtTarget() {
+  stopAll();
+  missionActive_ = false;
+  autoState_ = AUTO_FINISHED;
+  autoCfg_.enabled = false;
 }
 
 void MissionController::processManualTimeout(unsigned long nowMs) {
@@ -257,41 +329,6 @@ void MissionController::processAuto(unsigned long nowMs, bool timeValid, uint32_
   }
 
   if (autoState_ == AUTO_MOVING_TO_TARGET) {
-    if (processQueue(nowMs)) beginGasScan(nowMs);
-  } else if (autoState_ == AUTO_RETURNING_HOME) {
-    if (processQueue(nowMs)) {
-      stopAll();
-      missionActive_ = false;
-      autoState_ = AUTO_FINISHED;
-      autoCfg_.enabled = false;
-    }
+    if (processQueue(nowMs)) finishMissionAtTarget();
   }
-}
-
-bool MissionController::processGasScan(unsigned long nowMs, int gasRaw,
-                                       void (*onSample)(int, int),
-                                       void (*onDone)(int, int)) {
-  if (!scanRunning_) return false;
-
-  const unsigned long elapsed = nowMs - scanStartedAt_;
-
-  if (lastGasSampleAt_ == 0 || nowMs - lastGasSampleAt_ >= GAS_SCAN_SAMPLE_MS) {
-    lastGasSampleAt_ = nowMs;
-    const int angle = (int)((elapsed * 360UL) / scan360Ms_) % 360;
-    if (gasRaw > scanPeakGas_) {
-      scanPeakGas_ = gasRaw;
-      scanPeakAngle_ = angle;
-    }
-    if (onSample) onSample(gasRaw, angle);
-  }
-
-  if (elapsed >= scan360Ms_) {
-    stopAll();
-    scanRunning_ = false;
-    if (onDone) onDone(scanPeakGas_, scanPeakAngle_);
-    queuePathTo(0, 0);
-    autoState_ = AUTO_RETURNING_HOME;
-    return true;
-  }
-  return false;
 }

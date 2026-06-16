@@ -11,8 +11,6 @@ enum AutoState {
   AUTO_DISABLED = 0,
   AUTO_WAITING_TIME,
   AUTO_MOVING_TO_TARGET,
-  AUTO_SCANNING_GAS,
-  AUTO_RETURNING_HOME,
   AUTO_FINISHED
 };
 
@@ -39,6 +37,9 @@ public:
   void begin(TankMotors* motors, Odometry* odom);
 
   void setCalibration(float countsPerCm, long turn90Counts, uint32_t scan360Ms);
+  void setMapSize(int sizeX, int sizeY);
+  int mapSizeX() const { return mapSizeX_; }
+  int mapSizeY() const { return mapSizeY_; }
   void setMode(ControlMode mode);
   void setAutoConfig(const AutoConfig& cfg);
   AutoConfig autoConfig() const { return autoCfg_; }
@@ -48,21 +49,18 @@ public:
   Pose pose() const { return pose_; }
 
   void driveXY(int x, int y);
+  void startManualMoveTo(int targetX, int targetY);
   void setManualDurationMs(int durationMs, unsigned long nowMs);
   void stopAll();
   void cancelAuto();
   void startAutoNow();
 
   void processManualTimeout(unsigned long nowMs);
+  void processManualEncMove(unsigned long nowMs);
   void processAuto(unsigned long nowMs, bool timeValid, uint32_t epoch);
-  bool processGasScan(unsigned long nowMs, int gasRaw,
-                      void (*onSample)(int gas, int angle),
-                      void (*onDone)(int peakGas, int peakAngle));
-  void beginGasScan(unsigned long nowMs);
 
   bool manualTimeoutActive() const { return manualAutoStop_; }
   bool missionActive() const { return missionActive_; }
-  bool scanRunning() const { return scanRunning_; }
 
   void queuePathTo(int dstX, int dstY);
 
@@ -80,6 +78,11 @@ private:
   float countsPerCm_;
   long turn90Counts_;
   uint32_t scan360Ms_;
+  int mapSizeX_;
+  int mapSizeY_;
+
+  void applyStraightTrim(int& left, int& right) const;
+  void finishMissionAtTarget();
 
   MotionStep queue_[32];
   uint8_t queueCount_;
@@ -90,16 +93,11 @@ private:
   long stepStartEncL_;
 
   bool missionActive_;
-  bool scanRunning_;
-  unsigned long scanStartedAt_;
-  unsigned long lastGasSampleAt_;
-  int scanPeakGas_;
-  int scanPeakAngle_;
-
   int manualX_;
   int manualY_;
   bool manualAutoStop_;
   unsigned long manualStopAt_;
+  bool manualEncMoveActive_;
 
   bool queuePush(int l, int r, long encTarget, bool isTurn,
                  uint32_t timeoutMs, int dx, int dy, int dh);
