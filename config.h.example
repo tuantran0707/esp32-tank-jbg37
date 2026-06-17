@@ -8,48 +8,50 @@
 #define TB_PORT       1883
 #define TB_TOKEN      "YOUR_THINGSBOARD_TOKEN"
 
-#define PIN_MOTOR_R_PWM 27
-#define PIN_MOTOR_R_IN1 26
-#define PIN_MOTOR_R_IN2 25
-#define PIN_MOTOR_L_PWM 13
-#define PIN_MOTOR_L_IN1 33
-#define PIN_MOTOR_L_IN2 32
+// L298N — firmware TRAI = OUT1/OUT2 (ENB), PHAI = OUT3/OUT4 (ENA)
+#define PIN_MOTOR_L_PWM 32  // ENB — motor TRAI
+#define PIN_MOTOR_L_IN1 27
+#define PIN_MOTOR_L_IN2 26
+#define PIN_MOTOR_R_PWM 14  // ENA — motor PHAI
+#define PIN_MOTOR_R_IN1 25
+#define PIN_MOTOR_R_IN2 33
 
-#define PIN_ENC_R_C1 12
-#define PIN_ENC_R_C2 14
-#define PIN_ENC_L_C1 35
-#define PIN_ENC_L_C2 34
+#define PIN_ENC_R_C1 22
+#define PIN_ENC_R_C2 23
+#define PIN_ENC_L_C1 18
+#define PIN_ENC_L_C2 19
 
-#define PIN_BUZZER 15
-#define PIN_GAS    36
+#define PIN_BUZZER 5
+#define PIN_GAS    36  // VP (SP) — cảm biến khí analog
 
 #define MOTOR_R_SIGN  1
-#define MOTOR_L_SIGN -1
+#define MOTOR_L_SIGN  1
 #define ENC_R_SIGN    1
 #define ENC_L_SIGN   -1
 
-#define PWM_FREQ_HZ   20000
+#define PWM_FREQ_HZ   1000  // L298N: 0.5–2 kHz (MOSFET driver TB6612 dùng ~20 kHz)
 #define PWM_RES_BITS  8
 #define PWM_MAX       255
-#define MAX_PWM_DUTY  180
-#define TURN_PWM_LEFT   165
-#define TURN_PWM_RIGHT  120
+#define MAX_PWM_DUTY  200
+#define PWM_DUTY_LEFT   200
+#define PWM_DUTY_RIGHT  160
+#define TURN_PWM_LEFT   194
+#define TURN_PWM_RIGHT  141
 #define TURN_PWM_DUTY   TURN_PWM_LEFT
 
-// Hieu chuan tam (motor_test phim m, 90cm): trimF=12 trimR=0 counts/cm=103.0
-#define STRAIGHT_FWD_RIGHT_TRIM  12
+#define STRAIGHT_FWD_RIGHT_TRIM  0
 #define STRAIGHT_REV_LEFT_TRIM   0
 
-#define DEFAULT_COUNTS_PER_CM  103.0f
+#define DEFAULT_COUNTS_PER_CM  111.0f
 // 1470 thieu ~3-4° → tang them ~60 counts (~1530 ≈ 93°)
-#define DEFAULT_TURN_90_COUNTS 1530L
+#define DEFAULT_TURN_90_COUNTS  601L
 #define DEFAULT_SCAN_360_MS    1700UL
 
 // Timeout bước tiến thẳng (auto): khớp motor_test phím m
 #define STRAIGHT_STEP_TIMEOUT_MS_PER_CM  95
 #define STRAIGHT_STEP_TIMEOUT_EXTRA_MS   2000
 
-#define PATH_COMP_Y_CM  15
+#define PATH_COMP_Y_CM  8
 #define PATH_COMP_X_CM -15
 
 #define MAP_SIZE_CM 150

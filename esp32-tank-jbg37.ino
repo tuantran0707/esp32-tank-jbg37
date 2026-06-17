@@ -1,5 +1,5 @@
 /*
- * ESP32 Tank — TB6612FNG + 2x JGB37 encoder + ThingsBoard
+ * ESP32 Tank — L298N + 2x JGB37 encoder + ThingsBoard
  *
  * Thư viện cần cài (Arduino Library Manager):
  *   - PubSubClient by Nick O'Leary
@@ -163,6 +163,50 @@ void publishEvent(const char* eventName, int gasRaw, int angle) {
   gMqtt.publish("v1/devices/me/telemetry", buf);
 }
 
+void publishArrivedStatus(int gasRaw) {
+  if (!gMqtt.connected()) return;
+
+  Pose p = gMission.pose();
+  AutoConfig cfg = gMission.autoConfig();
+
+  StaticJsonDocument<256> doc;
+  doc["status"] = "arrived";
+  doc["mode"] = modeToText(gMission.mode());
+  doc["est_x"] = p.x;
+  doc["est_y"] = p.y;
+  doc["target_x"] = cfg.targetX;
+  doc["target_y"] = cfg.targetY;
+  doc["map_size_x"] = gMission.mapSizeX();
+  doc["map_size_y"] = gMission.mapSizeY();
+  doc["enc_l"] = gOdom.getLeftCount();
+  doc["enc_r"] = gOdom.getRightCount();
+  if (gasRaw >= 0) doc["gas_raw"] = gasRaw;
+
+  char buf[256];
+  serializeJson(doc, buf);
+  gMqtt.publish("v1/devices/me/telemetry", buf);
+  Serial.println("[MQTT] telemetry status=arrived");
+}
+
+void publishCalibrationAttributes() {
+  if (!gMqtt.connected()) return;
+
+  StaticJsonDocument<256> doc;
+  doc["counts_per_cm"] = gCountsPerCm;
+  doc["turn_90_counts"] = gTurn90Counts;
+  doc["scan_360_ms"] = gScan360Ms;
+  doc["pwm_duty_left"] = PWM_DUTY_LEFT;
+  doc["pwm_duty_right"] = PWM_DUTY_RIGHT;
+  doc["map_size_x"] = gMapSizeX;
+  doc["map_size_y"] = gMapSizeY;
+
+  char buf[256];
+  serializeJson(doc, buf);
+  gMqtt.publish("v1/devices/me/attributes", buf);
+  Serial.printf("[MQTT] client attributes: counts/cm=%.1f turn90=%ld PWM %d/%d\n",
+                gCountsPerCm, gTurn90Counts, PWM_DUTY_LEFT, PWM_DUTY_RIGHT);
+}
+
 void publishTelemetry(bool force) {
   if (!gMqtt.connected()) return;
   unsigned long nowMs = millis();
@@ -184,6 +228,7 @@ void publishTelemetry(bool force) {
   doc["map_size_y"] = gMission.mapSizeY();
   doc["enc_l"] = gOdom.getLeftCount();
   doc["enc_r"] = gOdom.getRightCount();
+  doc["counts_per_cm"] = gCountsPerCm;
   doc["mode"] = modeToText(gMission.mode());
   if (gasAbove) doc["detect"] = true;
 
@@ -365,6 +410,7 @@ void mqttOnConnected() {
   gMqttSubscribed = true;
   Serial.println("[MQTT] OK subscribe v1/devices/me/attributes");
   Serial.println("[MQTT] Cho lenh Shared attributes tu ThingsBoard...");
+  publishCalibrationAttributes();
 }
 
 void connectWiFi() {
@@ -445,8 +491,8 @@ void setup() {
   connectWiFi();
   setupMqttClient();
   connectMQTT();
-  Serial.printf("[CAL] counts/cm=%.1f trimF=%d trimR=%d turnL=%d turnR=%d turn90=%ld\n",
-                gCountsPerCm, STRAIGHT_FWD_RIGHT_TRIM, STRAIGHT_REV_LEFT_TRIM,
+  Serial.printf("[CAL] PWM L/R=%d/%d counts/cm=%.1f turnL=%d turnR=%d turn90=%ld\n",
+                PWM_DUTY_LEFT, PWM_DUTY_RIGHT, gCountsPerCm,
                 TURN_PWM_LEFT, TURN_PWM_RIGHT, gTurn90Counts);
   Serial.println("=== Ready ===");
 }
@@ -479,11 +525,19 @@ void loop() {
   const AutoState st = gMission.autoState();
   if (st == AUTO_FINISHED && lastAutoState == AUTO_MOVING_TO_TARGET) {
     clearScheduleFS();
-    publishEvent("arrived_target", gasRaw, -1);
+    publishArrivedStatus(gasRaw);
     publishEvent("gas_at_target", gasRaw, -1);
     publishTelemetry(true);
   }
   lastAutoState = st;
+
+  static bool lastManualEncMove = false;
+  const bool manualMove = gMission.manualEncMoveActive();
+  if (lastManualEncMove && !manualMove && gMission.mode() == MODE_MANUAL) {
+    publishArrivedStatus(gasRaw);
+    publishTelemetry(true);
+  }
+  lastManualEncMove = manualMove;
 
   if (gMission.mode() == MODE_MANUAL) {
     updateBuzzer(gasRaw);

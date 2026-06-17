@@ -20,8 +20,8 @@ Odometry::Odometry()
 void Odometry::begin() {
   pinMode(PIN_ENC_R_C1, INPUT_PULLUP);
   pinMode(PIN_ENC_R_C2, INPUT_PULLUP);
-  pinMode(PIN_ENC_L_C1, INPUT);  // GPIO34/35: trở kéo 10k ngoài
-  pinMode(PIN_ENC_L_C2, INPUT);
+  pinMode(PIN_ENC_L_C1, INPUT_PULLUP);
+  pinMode(PIN_ENC_L_C2, INPUT_PULLUP);
 
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_R_C1), isrEncRight, RISING);
   attachInterrupt(digitalPinToInterrupt(PIN_ENC_L_C1), isrEncLeft, RISING);

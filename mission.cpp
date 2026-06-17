@@ -11,6 +11,12 @@
 #ifndef PATH_COMP_X_CM
 #define PATH_COMP_X_CM -15
 #endif
+#ifndef PWM_DUTY_LEFT
+#define PWM_DUTY_LEFT MAX_PWM_DUTY
+#endif
+#ifndef PWM_DUTY_RIGHT
+#define PWM_DUTY_RIGHT MAX_PWM_DUTY
+#endif
 
 MissionController::MissionController()
     : motors_(nullptr),
@@ -54,9 +60,13 @@ void MissionController::setCalibration(float countsPerCm, long turn90Counts, uin
 
 void MissionController::applyStraightTrim(int& left, int& right) const {
   if (left > 0 && right > 0 && left == right) {
-    right = constrain(right - STRAIGHT_FWD_RIGHT_TRIM, 0, MAX_PWM_DUTY);
+    const int scale = left;
+    left = (PWM_DUTY_LEFT * scale) / MAX_PWM_DUTY;
+    right = (PWM_DUTY_RIGHT * scale) / MAX_PWM_DUTY;
   } else if (left < 0 && right < 0 && left == right) {
-    left = constrain(left + STRAIGHT_REV_LEFT_TRIM, -MAX_PWM_DUTY, 0);
+    const int scale = -left;
+    left = -((PWM_DUTY_LEFT * scale) / MAX_PWM_DUTY);
+    right = -((PWM_DUTY_RIGHT * scale) / MAX_PWM_DUTY);
   }
 }
 
@@ -166,9 +176,10 @@ void MissionController::queueAddTurnLeft90() {
 void MissionController::queueTurnTo(Heading target) {
   const int diff = ((int)target - (int)pose_.heading + 4) % 4;
   if (diff == 0) return;
-  if (diff == 1) queueAddTurnRight90();
-  else if (diff == 3) queueAddTurnLeft90();
-  else { queueAddTurnRight90(); queueAddTurnRight90(); }
+  // diff=1: clockwise EAST — physical tank turns right with Left90 duties
+  if (diff == 1) queueAddTurnLeft90();
+  else if (diff == 3) queueAddTurnRight90();
+  else { queueAddTurnLeft90(); queueAddTurnLeft90(); }
 }
 
 void MissionController::queueAddForwardCm(int cm) {
@@ -198,8 +209,8 @@ void MissionController::queueAddForwardCm(int cm) {
     case HEAD_SOUTH: dy = -cm; break;
     case HEAD_WEST:  dx = -cm; break;
   }
-  int leftDuty = MAX_PWM_DUTY;
-  int rightDuty = MAX_PWM_DUTY;
+  int leftDuty = PWM_DUTY_LEFT;
+  int rightDuty = PWM_DUTY_RIGHT;
   applyStraightTrim(leftDuty, rightDuty);
   queuePush(leftDuty, rightDuty, encTarget, false, timeout, dx, dy, 0);
 }
@@ -255,7 +266,13 @@ bool MissionController::encoderStepDone(const MotionStep& step) const {
 
   if (step.isTurn) {
     const long progress = (dL - dR) / 2;
-    if (dL <= 0 || dR >= 0) return false;
+    if (step.leftDuty > 0 && step.rightDuty < 0) {
+      if (dL <= 0 || dR >= 0) return false;
+    } else if (step.leftDuty < 0 && step.rightDuty > 0) {
+      if (dL >= 0 || dR <= 0) return false;
+    } else {
+      return false;
+    }
     return labs(progress) >= step.encTarget;
   }
 

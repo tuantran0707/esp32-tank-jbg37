@@ -60,6 +60,7 @@ public:
   void processAuto(unsigned long nowMs, bool timeValid, uint32_t epoch);
 
   bool manualTimeoutActive() const { return manualAutoStop_; }
+  bool manualEncMoveActive() const { return manualEncMoveActive_; }
   bool missionActive() const { return missionActive_; }
 
   void queuePathTo(int dstX, int dstY);
