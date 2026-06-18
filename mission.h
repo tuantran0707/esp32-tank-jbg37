@@ -11,13 +11,14 @@ enum AutoState {
   AUTO_DISABLED = 0,
   AUTO_WAITING_TIME,
   AUTO_MOVING_TO_TARGET,
+  AUTO_AT_TARGET,
+  AUTO_RETURNING,
   AUTO_FINISHED
 };
 
 struct AutoConfig {
-  bool enabled;
-  int targetX;
-  int targetY;
+  int xAuto;
+  int yAuto;
   uint32_t runAtEpoch;
 };
 
@@ -54,6 +55,7 @@ public:
   void stopAll();
   void cancelAuto();
   void startAutoNow();
+  void startReturnHome();
 
   void processManualTimeout(unsigned long nowMs);
   void processManualEncMove(unsigned long nowMs);
@@ -78,12 +80,17 @@ private:
 
   float countsPerCm_;
   long turn90Counts_;
+  long turn90LeftCounts_;
+  long turn90RightCounts_;
+  long turn180Counts_;
   uint32_t scan360Ms_;
   int mapSizeX_;
   int mapSizeY_;
 
   void applyStraightTrim(int& left, int& right) const;
-  void finishMissionAtTarget();
+  void finishReachTarget(unsigned long nowMs);
+  void finishReturnHome();
+  void queueReturnHome();
 
   MotionStep queue_[32];
   uint8_t queueCount_;
@@ -99,15 +106,20 @@ private:
   bool manualAutoStop_;
   unsigned long manualStopAt_;
   bool manualEncMoveActive_;
+  unsigned long dwellEndsAtMs_;
+  uint32_t lastTriggeredEpoch_;
 
   bool queuePush(int l, int r, long encTarget, bool isTurn,
                  uint32_t timeoutMs, int dx, int dy, int dh);
   void queueClear();
   void queueAddTurnRight90();
   void queueAddTurnLeft90();
+  void queueAddTurn180();
   void queueTurnTo(Heading target);
   void queueAddForwardCm(int cm);
   bool processQueue(unsigned long nowMs);
   bool encoderStepDone(const MotionStep& step) const;
+  void updateEncClosedLoop(const MotionStep& step);
+  static int clampMotorDuty(int duty);
   void applyStepToPose(const MotionStep& step);
 };

@@ -43,8 +43,18 @@
 #define STRAIGHT_REV_LEFT_TRIM   0
 
 #define DEFAULT_COUNTS_PER_CM  111.0f
-// 1470 thieu ~3-4° → tang them ~60 counts (~1530 ≈ 93°)
 #define DEFAULT_TURN_90_COUNTS  601L
+
+#define TURN_90_LEFT_COUNTS   601L
+#define TURN_90_RIGHT_COUNTS  601L
+#define TURN_180_COUNTS       1202L
+
+#define STRAIGHT_ENC_KP        2
+#define STRAIGHT_ENC_MAX_TRIM  45
+#define TURN_PWM_MIN           85
+#define TURN_DECEL_ZONE_PCT    25
+#define PWM_MIN_DUTY           70
+
 #define DEFAULT_SCAN_360_MS    1700UL
 
 // Timeout bước tiến thẳng (auto): khớp motor_test phím m
@@ -61,11 +71,9 @@
 #define TIME_SYNC_INTERVAL_MS    3600000UL
 #define GAS_SCAN_SAMPLE_MS       200UL
 #define GAS_ALERT_THRESHOLD      700
+#define AUTO_DWELL_MS            10000UL
 
 #define TB_SHARED_KEYS \
-  "mode,x,y,duration,stop," \
-  "auto_enabled,target_x,target_y,run_at_epoch,auto_start_now," \
-  "map_size,map_size_x,map_size_y," \
-  "counts_per_cm,turn_90_counts,scan_360_ms"
+  "mode,x,y,x_auto,y_auto,run_at_epoch,gas_threshold,stop"
 
-#define SCHEDULE_FILE "/auto_schedule.json"
+#define SHARED_CONFIG_FILE "/shared_config.json"

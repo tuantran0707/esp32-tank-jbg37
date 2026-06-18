@@ -39,6 +39,7 @@ unsigned long gLastTimeSync = 0;
 unsigned long gLastMqttAttempt = 0;
 bool gTimeValid = false;
 bool gGasAboveThreshold = false;
+int gGasThreshold = GAS_ALERT_THRESHOLD;
 bool gMqttConfigured = false;
 
 static const unsigned long MQTT_RECONNECT_MS = 5000UL;
@@ -53,6 +54,8 @@ const char* autoStateToText(AutoState st) {
     case AUTO_DISABLED: return "disabled";
     case AUTO_WAITING_TIME: return "waiting_time";
     case AUTO_MOVING_TO_TARGET: return "moving_to_target";
+    case AUTO_AT_TARGET: return "at_target";
+    case AUTO_RETURNING: return "returning";
     case AUTO_FINISHED: return "finished";
     default: return "unknown";
   }
@@ -72,7 +75,7 @@ void setBuzzer(bool on) {
 }
 
 void updateBuzzer(int gasRaw) {
-  setBuzzer(gasRaw > GAS_ALERT_THRESHOLD);
+  setBuzzer(gasRaw > gGasThreshold);
 }
 
 // -------------------------------------------------------------------
@@ -91,101 +94,84 @@ void syncTimeNtp(bool force) {
   }
 }
 
-void saveScheduleToFS() {
-  AutoConfig cfg = gMission.autoConfig();
-  File f = LittleFS.open(SCHEDULE_FILE, "w");
+void saveSharedConfigToFS() {
+  File f = LittleFS.open(SHARED_CONFIG_FILE, "w");
   if (!f) return;
 
-  StaticJsonDocument<128> doc;
-  doc["enabled"] = cfg.enabled;
-  doc["target_x"] = cfg.targetX;
-  doc["target_y"] = cfg.targetY;
+  AutoConfig cfg = gMission.autoConfig();
+  StaticJsonDocument<192> doc;
+  doc["mode"] = modeToText(gMission.mode());
+  doc["x_auto"] = cfg.xAuto;
+  doc["y_auto"] = cfg.yAuto;
   doc["run_at_epoch"] = cfg.runAtEpoch;
+  doc["gas_threshold"] = gGasThreshold;
   serializeJson(doc, f);
   f.close();
 }
 
-void loadScheduleFromFS() {
-  if (!LittleFS.exists(SCHEDULE_FILE)) return;
+void loadSharedConfigFromFS() {
+  if (!LittleFS.exists(SHARED_CONFIG_FILE)) return;
 
-  File f = LittleFS.open(SCHEDULE_FILE, "r");
+  File f = LittleFS.open(SHARED_CONFIG_FILE, "r");
   if (!f) return;
 
-  StaticJsonDocument<128> doc;
+  StaticJsonDocument<192> doc;
   if (deserializeJson(doc, f)) {
     f.close();
     return;
   }
   f.close();
 
-  AutoConfig cfg;
-  cfg.enabled = doc["enabled"] | false;
-  cfg.targetX = constrain(doc["target_x"] | 0, 0, gMapSizeX);
-  cfg.targetY = constrain(doc["target_y"] | 0, 0, gMapSizeY);
+  if (doc.containsKey("gas_threshold")) {
+    gGasThreshold = doc["gas_threshold"] | gGasThreshold;
+  }
+
+  AutoConfig cfg = gMission.autoConfig();
+  cfg.xAuto = constrain(doc["x_auto"] | 0, 0, gMapSizeX);
+  cfg.yAuto = constrain(doc["y_auto"] | 0, 0, gMapSizeY);
   cfg.runAtEpoch = doc["run_at_epoch"] | 0;
   gMission.setAutoConfig(cfg);
 
-  if (cfg.enabled && cfg.runAtEpoch > 0) {
-    gMission.setMode(MODE_AUTO);
-    Serial.println("[FS] Resume auto schedule");
-  }
+  const char* m = doc["mode"] | "manual";
+  gMission.setMode(strcmp(m, "auto") == 0 ? MODE_AUTO : MODE_MANUAL);
+  Serial.printf("[FS] mode=%s x_auto=%d y_auto=%d run_at=%lu gas_thr=%d\n",
+                m, cfg.xAuto, cfg.yAuto, (unsigned long)cfg.runAtEpoch, gGasThreshold);
 }
 
-void clearScheduleFS() {
-  if (LittleFS.exists(SCHEDULE_FILE)) LittleFS.remove(SCHEDULE_FILE);
+void clearSharedConfigFS() {
+  if (LittleFS.exists(SHARED_CONFIG_FILE)) LittleFS.remove(SHARED_CONFIG_FILE);
+}
+
+void requestSharedAttributes() {
+  if (!gMqtt.connected()) return;
+
+  StaticJsonDocument<256> doc;
+  doc["sharedKeys"] = TB_SHARED_KEYS;
+  char buf[256];
+  serializeJson(doc, buf);
+  gMqtt.publish("v1/devices/me/attributes/request/1", buf);
+  Serial.println("[MQTT] request shared attributes");
 }
 
 // -------------------------------------------------------------------
-void publishEvent(const char* eventName, int gasRaw, int angle) {
+void publishArrivedTelemetry(int gasRaw) {
   if (!gMqtt.connected()) return;
 
-  StaticJsonDocument<256> doc;
-  doc["event"] = eventName;
+  const Pose p = gMission.pose();
+  const bool isManual = (gMission.mode() == MODE_MANUAL);
+
+  StaticJsonDocument<192> doc;
+  doc["status"] = isManual ? "manual_arrived" : "arrived";
   doc["mode"] = modeToText(gMission.mode());
-  doc["auto_state"] = autoStateToText(gMission.autoState());
-  doc["epoch"] = nowEpoch();
-  if (gasRaw >= 0) doc["gas_raw"] = gasRaw;
-  if (angle >= 0) doc["angle_deg"] = angle;
+  doc["x"] = p.x;
+  doc["y"] = p.y;
+  doc["gas"] = gasRaw;
 
-  AutoConfig cfg = gMission.autoConfig();
-  Pose p = gMission.pose();
-  doc["target_x"] = cfg.targetX;
-  doc["target_y"] = cfg.targetY;
-  doc["map_size_x"] = gMission.mapSizeX();
-  doc["map_size_y"] = gMission.mapSizeY();
-  doc["est_x"] = p.x;
-  doc["est_y"] = p.y;
-  doc["enc_l"] = gOdom.getLeftCount();
-  doc["enc_r"] = gOdom.getRightCount();
-
-  char buf[256];
+  char buf[192];
   serializeJson(doc, buf);
   gMqtt.publish("v1/devices/me/telemetry", buf);
-}
-
-void publishArrivedStatus(int gasRaw) {
-  if (!gMqtt.connected()) return;
-
-  Pose p = gMission.pose();
-  AutoConfig cfg = gMission.autoConfig();
-
-  StaticJsonDocument<256> doc;
-  doc["status"] = "arrived";
-  doc["mode"] = modeToText(gMission.mode());
-  doc["est_x"] = p.x;
-  doc["est_y"] = p.y;
-  doc["target_x"] = cfg.targetX;
-  doc["target_y"] = cfg.targetY;
-  doc["map_size_x"] = gMission.mapSizeX();
-  doc["map_size_y"] = gMission.mapSizeY();
-  doc["enc_l"] = gOdom.getLeftCount();
-  doc["enc_r"] = gOdom.getRightCount();
-  if (gasRaw >= 0) doc["gas_raw"] = gasRaw;
-
-  char buf[256];
-  serializeJson(doc, buf);
-  gMqtt.publish("v1/devices/me/telemetry", buf);
-  Serial.println("[MQTT] telemetry status=arrived");
+  Serial.printf("[MQTT] arrived: status=%s x=%d y=%d gas=%d\n",
+                isManual ? "manual_arrived" : "arrived", p.x, p.y, gasRaw);
 }
 
 void publishCalibrationAttributes() {
@@ -214,23 +200,16 @@ void publishTelemetry(bool force) {
   gLastTelemetry = nowMs;
 
   int gasRaw = analogRead(PIN_GAS);
-  bool gasAbove = (gasRaw > GAS_ALERT_THRESHOLD);
-  if (gasAbove && !gGasAboveThreshold) publishEvent("gas_over_threshold", gasRaw, -1);
+  bool gasAbove = (gasRaw > gGasThreshold);
   gGasAboveThreshold = gasAbove;
   updateBuzzer(gasRaw);
 
   Pose p = gMission.pose();
   StaticJsonDocument<192> doc;
-  doc["gas_raw"] = gasRaw;
-  doc["est_x"] = p.x;
-  doc["est_y"] = p.y;
-  doc["map_size_x"] = gMission.mapSizeX();
-  doc["map_size_y"] = gMission.mapSizeY();
-  doc["enc_l"] = gOdom.getLeftCount();
-  doc["enc_r"] = gOdom.getRightCount();
-  doc["counts_per_cm"] = gCountsPerCm;
+  doc["gas"] = gasRaw;
+  doc["x"] = p.x;
+  doc["y"] = p.y;
   doc["mode"] = modeToText(gMission.mode());
-  if (gasAbove) doc["detect"] = true;
 
   char buf[192];
   serializeJson(doc, buf);
@@ -259,113 +238,52 @@ void applyAttributeJson(JsonVariant data) {
   serializeJson(data, Serial);
   Serial.println();
 
-  if (data.containsKey("mode")) {
-    const char* m = data["mode"] | "manual";
-    gMission.setMode(strcmp(m, "auto") == 0 ? MODE_AUTO : MODE_MANUAL);
-    Serial.printf("[ATTR] mode=%s\n", modeToText(gMission.mode()));
-  }
-
   if (jsonBool(data["stop"])) {
     gMission.stopAll();
     gMission.cancelAuto();
-    clearScheduleFS();
     return;
   }
 
-  if (data.containsKey("counts_per_cm")) {
-    gCountsPerCm = data["counts_per_cm"].as<float>();
-    gMission.setCalibration(gCountsPerCm, gTurn90Counts, gScan360Ms);
-  }
-  if (data.containsKey("turn_90_counts")) {
-    gTurn90Counts = data["turn_90_counts"] | gTurn90Counts;
-    gMission.setCalibration(gCountsPerCm, gTurn90Counts, gScan360Ms);
-  }
-  if (data.containsKey("scan_360_ms")) {
-    gScan360Ms = data["scan_360_ms"] | gScan360Ms;
-    gMission.setCalibration(gCountsPerCm, gTurn90Counts, gScan360Ms);
-  }
+  bool configChanged = false;
 
-  if (data.containsKey("map_size")) {
-    const int sz = data["map_size"] | gMapSizeX;
-    gMapSizeX = gMapSizeY = sz;
-    gMission.setMapSize(gMapSizeX, gMapSizeY);
-    Serial.printf("[ATTR] map_size=%d x %d\n", gMapSizeX, gMapSizeY);
-  }
-  if (data.containsKey("map_size_x")) {
-    gMapSizeX = data["map_size_x"] | gMapSizeX;
-    gMission.setMapSize(gMapSizeX, gMapSizeY);
-  }
-  if (data.containsKey("map_size_y")) {
-    gMapSizeY = data["map_size_y"] | gMapSizeY;
-    gMission.setMapSize(gMapSizeX, gMapSizeY);
-  }
-
-  if (gMission.mode() == MODE_MANUAL && (data.containsKey("x") || data.containsKey("y"))) {
-    const int duration = data["duration"] | 0;
-
-    if (duration == 0) {
-      const Pose p = gMission.pose();
-      const int targetX = data.containsKey("x") ? data["x"].as<int>() : p.x;
-      const int targetY = data.containsKey("y") ? data["y"].as<int>() : p.y;
-      gMission.startManualMoveTo(targetX, targetY);
-      Serial.printf("[MANUAL] di toi (%d,%d) tu (%d,%d)\n",
-                    targetX, targetY, p.x, p.y);
-    } else {
-      const int x = data["x"] | 0;
-      const int y = data["y"] | 0;
-      gMission.driveXY(x, y);
-      gMission.setManualDurationMs(duration, millis());
-      Serial.printf("[MANUAL] joystick x=%d y=%d dur=%d ms\n", x, y, duration);
-    }
+  if (data.containsKey("gas_threshold")) {
+    gGasThreshold = data["gas_threshold"] | gGasThreshold;
+    configChanged = true;
+    Serial.printf("[ATTR] gas_threshold=%d\n", gGasThreshold);
   }
 
   AutoConfig cfg = gMission.autoConfig();
-  bool scheduleChanged = false;
-
-  if (data.containsKey("auto_enabled")) {
-    cfg.enabled = jsonBool(data["auto_enabled"]);
-    if (!cfg.enabled) {
-      gMission.cancelAuto();
-      clearScheduleFS();
-    }
-    scheduleChanged = true;
+  if (data.containsKey("x_auto")) {
+    cfg.xAuto = constrain(data["x_auto"].as<int>(), 0, gMapSizeX);
+    configChanged = true;
   }
-  if (data.containsKey("target_x")) {
-    cfg.targetX = constrain(data["target_x"].as<int>(), 0, gMapSizeX);
-    scheduleChanged = true;
-  }
-  if (data.containsKey("target_y")) {
-    cfg.targetY = constrain(data["target_y"].as<int>(), 0, gMapSizeY);
-    scheduleChanged = true;
+  if (data.containsKey("y_auto")) {
+    cfg.yAuto = constrain(data["y_auto"].as<int>(), 0, gMapSizeY);
+    configChanged = true;
   }
   if (data.containsKey("run_at_epoch")) {
     cfg.runAtEpoch = data["run_at_epoch"] | 0;
-    scheduleChanged = true;
+    configChanged = true;
   }
   gMission.setAutoConfig(cfg);
 
-  if (scheduleChanged && cfg.enabled) {
-    saveScheduleToFS();
+  if (data.containsKey("mode")) {
+    const char* m = data["mode"] | "manual";
+    gMission.setMode(strcmp(m, "auto") == 0 ? MODE_AUTO : MODE_MANUAL);
+    configChanged = true;
+    Serial.printf("[ATTR] mode=%s\n", modeToText(gMission.mode()));
   }
 
-  if (data.containsKey("auto_start_now")) {
-    static bool lastAutoStartNow = false;
-    const bool wantStart = jsonBool(data["auto_start_now"]);
-    if (wantStart && !lastAutoStartNow) {
-      if (gMission.mode() != MODE_AUTO) {
-        Serial.println("[ATTR] auto_start_now ignored — set mode=auto truoc");
-      } else {
-        cfg = gMission.autoConfig();
-        cfg.enabled = true;
-        cfg.runAtEpoch = 0;
-        gMission.setAutoConfig(cfg);
-        saveScheduleToFS();
-        gMission.startAutoNow();
-        Serial.printf("[ATTR] AUTO START → target (%d,%d)\n", cfg.targetX, cfg.targetY);
-        publishEvent("auto_started", analogRead(PIN_GAS), -1);
-      }
+  if (configChanged) saveSharedConfigToFS();
+
+  if (gMission.mode() == MODE_MANUAL) {
+    if (data.containsKey("x") && data.containsKey("y")) {
+      const int targetX = data["x"].as<int>();
+      const int targetY = data["y"].as<int>();
+      const Pose p = gMission.pose();
+      gMission.startManualMoveTo(targetX, targetY);
+      Serial.printf("[MANUAL] (%d,%d) -> (%d,%d)\n", p.x, p.y, targetX, targetY);
     }
-    lastAutoStartNow = wantStart;
   }
 }
 
@@ -394,6 +312,10 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
     Serial.println("[MQTT] (goi shared attributes)");
     data = doc["shared"];
   }
+  if (strncmp(topic, "v1/devices/me/attributes/response/", 35) == 0) {
+    Serial.println("[MQTT] (phan hoi shared attributes)");
+    if (doc.containsKey("shared")) data = doc["shared"];
+  }
   applyAttributeJson(data);
 }
 
@@ -406,11 +328,16 @@ void mqttOnConnected() {
     Serial.println("[MQTT] FAIL subscribe v1/devices/me/attributes");
     return;
   }
+  if (!gMqtt.subscribe("v1/devices/me/attributes/response/+")) {
+    Serial.println("[MQTT] FAIL subscribe attributes/response/+");
+    return;
+  }
 
   gMqttSubscribed = true;
   Serial.println("[MQTT] OK subscribe v1/devices/me/attributes");
   Serial.println("[MQTT] Cho lenh Shared attributes tu ThingsBoard...");
   publishCalibrationAttributes();
+  requestSharedAttributes();
 }
 
 void connectWiFi() {
@@ -485,7 +412,7 @@ void setup() {
   if (!LittleFS.begin(true)) {
     Serial.println("[FS] LittleFS mount failed");
   } else {
-    loadScheduleFromFS();
+    loadSharedConfigFromFS();
   }
 
   connectWiFi();
@@ -517,31 +444,28 @@ void loop() {
 
   syncTimeNtp(false);
 
-  gMission.processManualTimeout(nowMs);
   gMission.processManualEncMove(nowMs);
   gMission.processAuto(nowMs, gTimeValid, nowEpoch());
 
   static AutoState lastAutoState = AUTO_DISABLED;
   const AutoState st = gMission.autoState();
-  if (st == AUTO_FINISHED && lastAutoState == AUTO_MOVING_TO_TARGET) {
-    clearScheduleFS();
-    publishArrivedStatus(gasRaw);
-    publishEvent("gas_at_target", gasRaw, -1);
-    publishTelemetry(true);
+  if (st == AUTO_AT_TARGET && lastAutoState == AUTO_MOVING_TO_TARGET) {
+    publishArrivedTelemetry(gasRaw);
+  }
+  if (st == AUTO_WAITING_TIME && lastAutoState == AUTO_RETURNING) {
+    Serial.println("[AUTO] ve (0,0) xong");
   }
   lastAutoState = st;
 
   static bool lastManualEncMove = false;
   const bool manualMove = gMission.manualEncMoveActive();
   if (lastManualEncMove && !manualMove && gMission.mode() == MODE_MANUAL) {
-    publishArrivedStatus(gasRaw);
-    publishTelemetry(true);
+    publishArrivedTelemetry(gasRaw);
+    Serial.printf("[MANUAL] arrived (%d,%d)\n", gMission.pose().x, gMission.pose().y);
   }
   lastManualEncMove = manualMove;
 
-  if (gMission.mode() == MODE_MANUAL) {
-    updateBuzzer(gasRaw);
-  }
+  updateBuzzer(gasRaw);
 
   publishTelemetry(false);
 }

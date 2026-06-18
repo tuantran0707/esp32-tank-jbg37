@@ -18,15 +18,43 @@
 #define PWM_DUTY_RIGHT MAX_PWM_DUTY
 #endif
 
+#ifndef TURN_90_LEFT_COUNTS
+#define TURN_90_LEFT_COUNTS  DEFAULT_TURN_90_COUNTS
+#endif
+#ifndef TURN_90_RIGHT_COUNTS
+#define TURN_90_RIGHT_COUNTS DEFAULT_TURN_90_COUNTS
+#endif
+#ifndef TURN_180_COUNTS
+#define TURN_180_COUNTS      (TURN_90_LEFT_COUNTS + TURN_90_RIGHT_COUNTS)
+#endif
+#ifndef STRAIGHT_ENC_KP
+#define STRAIGHT_ENC_KP        2
+#endif
+#ifndef STRAIGHT_ENC_MAX_TRIM
+#define STRAIGHT_ENC_MAX_TRIM  45
+#endif
+#ifndef TURN_PWM_MIN
+#define TURN_PWM_MIN           85
+#endif
+#ifndef TURN_DECEL_ZONE_PCT
+#define TURN_DECEL_ZONE_PCT    25
+#endif
+#ifndef PWM_MIN_DUTY
+#define PWM_MIN_DUTY           70
+#endif
+
 MissionController::MissionController()
     : motors_(nullptr),
       odom_(nullptr),
       mode_(MODE_MANUAL),
       autoState_(AUTO_DISABLED),
-      autoCfg_{false, 0, 0, 0},
+      autoCfg_{0, 0, 0},
       pose_{0, 0, HEAD_NORTH},
       countsPerCm_(DEFAULT_COUNTS_PER_CM),
       turn90Counts_(DEFAULT_TURN_90_COUNTS),
+      turn90LeftCounts_(TURN_90_LEFT_COUNTS),
+      turn90RightCounts_(TURN_90_RIGHT_COUNTS),
+      turn180Counts_(TURN_180_COUNTS),
       scan360Ms_(DEFAULT_SCAN_360_MS),
       mapSizeX_(MAP_SIZE_CM),
       mapSizeY_(MAP_SIZE_CM),
@@ -41,7 +69,9 @@ MissionController::MissionController()
       manualY_(0),
       manualAutoStop_(false),
       manualStopAt_(0),
-      manualEncMoveActive_(false) {}
+      manualEncMoveActive_(false),
+      dwellEndsAtMs_(0),
+      lastTriggeredEpoch_(0) {}
 
 void MissionController::begin(TankMotors* motors, Odometry* odom) {
   motors_ = motors;
@@ -51,11 +81,20 @@ void MissionController::begin(TankMotors* motors, Odometry* odom) {
 void MissionController::setCalibration(float countsPerCm, long turn90Counts, uint32_t scan360Ms) {
   countsPerCm_ = countsPerCm;
   turn90Counts_ = turn90Counts;
+  turn90LeftCounts_ = turn90Counts;
+  turn90RightCounts_ = turn90Counts;
+  turn180Counts_ = turn90Counts * 2;
   scan360Ms_ = scan360Ms;
   if (odom_) {
     odom_->setCountsPerCm(countsPerCm_);
     odom_->setTurn90Counts(turn90Counts_);
   }
+}
+
+int MissionController::clampMotorDuty(int duty) {
+  if (duty == 0) return 0;
+  const int s = duty > 0 ? 1 : -1;
+  return s * constrain(abs(duty), PWM_MIN_DUTY, MAX_PWM_DUTY);
 }
 
 void MissionController::applyStraightTrim(int& left, int& right) const {
@@ -76,11 +115,15 @@ void MissionController::setMapSize(int sizeX, int sizeY) {
 }
 
 void MissionController::setMode(ControlMode mode) {
+  if (mode == MODE_MANUAL && mode_ == MODE_AUTO) cancelAuto();
   mode_ = mode;
-  if (mode_ == MODE_MANUAL) cancelAuto();
+  if (mode_ == MODE_AUTO && !missionActive_ && autoState_ == AUTO_DISABLED) {
+    autoState_ = AUTO_WAITING_TIME;
+  }
 }
 
 void MissionController::setAutoConfig(const AutoConfig& cfg) {
+  if (cfg.runAtEpoch != autoCfg_.runAtEpoch) lastTriggeredEpoch_ = 0;
   autoCfg_ = cfg;
 }
 
@@ -164,22 +207,26 @@ void MissionController::queueClear() {
 }
 
 void MissionController::queueAddTurnRight90() {
-  queuePush(TURN_PWM_LEFT, -TURN_PWM_RIGHT, turn90Counts_, true,
-            (uint32_t)(turn90Counts_ * 4), 0, 0, +1);
+  queuePush(TURN_PWM_LEFT, -TURN_PWM_RIGHT, turn90RightCounts_, true,
+            (uint32_t)(turn90RightCounts_ * 5), 0, 0, +1);
 }
 
 void MissionController::queueAddTurnLeft90() {
-  queuePush(-TURN_PWM_LEFT, TURN_PWM_RIGHT, turn90Counts_, true,
-            (uint32_t)(turn90Counts_ * 4), 0, 0, -1);
+  queuePush(-TURN_PWM_LEFT, TURN_PWM_RIGHT, turn90LeftCounts_, true,
+            (uint32_t)(turn90LeftCounts_ * 5), 0, 0, -1);
+}
+
+void MissionController::queueAddTurn180() {
+  queuePush(-TURN_PWM_LEFT, TURN_PWM_RIGHT, turn180Counts_, true,
+            (uint32_t)(turn180Counts_ * 5), 0, 0, -2);
 }
 
 void MissionController::queueTurnTo(Heading target) {
   const int diff = ((int)target - (int)pose_.heading + 4) % 4;
   if (diff == 0) return;
-  // diff=1: clockwise EAST — physical tank turns right with Left90 duties
   if (diff == 1) queueAddTurnLeft90();
   else if (diff == 3) queueAddTurnRight90();
-  else { queueAddTurnLeft90(); queueAddTurnLeft90(); }
+  else queueAddTurn180();
 }
 
 void MissionController::queueAddForwardCm(int cm) {
@@ -253,6 +300,32 @@ void MissionController::queuePathTo(int dstX, int dstY) {
   pose_ = saved;
 }
 
+void MissionController::queueReturnHome() {
+  queueClear();
+  const Pose saved = pose_;
+  const int px = pose_.x;
+  const int py = pose_.y;
+
+  queueAddTurn180();
+  pose_.heading = (Heading)(((int)pose_.heading + 2) % 4);
+
+  if (px > 0) {
+    queueTurnTo(HEAD_WEST);
+    pose_.heading = HEAD_WEST;
+    queueAddForwardCm(px);
+    pose_.x = 0;
+  }
+
+  if (py > 0) {
+    queueTurnTo(HEAD_SOUTH);
+    pose_.heading = HEAD_SOUTH;
+    queueAddForwardCm(py);
+    pose_.y = 0;
+  }
+
+  pose_ = saved;
+}
+
 void MissionController::applyStepToPose(const MotionStep& step) {
   pose_.x = constrain(pose_.x + step.deltaX, 0, mapSizeX_);
   pose_.y = constrain(pose_.y + step.deltaY, 0, mapSizeY_);
@@ -265,19 +338,45 @@ bool MissionController::encoderStepDone(const MotionStep& step) const {
   const long dL = odom_->getLeftCount() - stepStartEncL_;
 
   if (step.isTurn) {
-    const long progress = (dL - dR) / 2;
-    if (step.leftDuty > 0 && step.rightDuty < 0) {
-      if (dL <= 0 || dR >= 0) return false;
-    } else if (step.leftDuty < 0 && step.rightDuty > 0) {
-      if (dL >= 0 || dR <= 0) return false;
-    } else {
-      return false;
-    }
-    return labs(progress) >= step.encTarget;
+    const long progress = labs((dL - dR) / 2);
+    return progress >= step.encTarget;
   }
 
-  if (dR <= 0 || dL <= 0) return false;
-  return ((dR + dL) / 2) >= step.encTarget;
+  const long fwdR = (step.rightDuty > 0) ? max(0L, dR) : max(0L, -dR);
+  const long fwdL = (step.leftDuty > 0) ? max(0L, dL) : max(0L, -dL);
+  return ((fwdR + fwdL) / 2) >= step.encTarget;
+}
+
+void MissionController::updateEncClosedLoop(const MotionStep& step) {
+  const long dR = odom_->getRightCount() - stepStartEncR_;
+  const long dL = odom_->getLeftCount() - stepStartEncL_;
+
+  if (!step.isTurn) {
+    const long err = dL - dR;
+    int corr = (int)(err * STRAIGHT_ENC_KP);
+    corr = constrain(corr, -STRAIGHT_ENC_MAX_TRIM, STRAIGHT_ENC_MAX_TRIM);
+    const int newL = clampMotorDuty(step.leftDuty - corr);
+    const int newR = clampMotorDuty(step.rightDuty + corr);
+    motors_->setDuties(newL, newR);
+    return;
+  }
+
+  const long progress = labs((dL - dR) / 2);
+  const long remaining = step.encTarget - progress;
+  if (remaining <= 0) return;
+
+  const long decelZone = max(1L, (step.encTarget * TURN_DECEL_ZONE_PCT) / 100);
+  if (remaining > decelZone) return;
+
+  int pwmL = abs(step.leftDuty);
+  int pwmR = abs(step.rightDuty);
+  int scale = (int)((remaining * 100L) / decelZone);
+  scale = constrain(scale, 55, 100);
+  pwmL = max((int)TURN_PWM_MIN, pwmL * scale / 100);
+  pwmR = max((int)TURN_PWM_MIN, pwmR * scale / 100);
+  const int sL = step.leftDuty >= 0 ? 1 : -1;
+  const int sR = step.rightDuty >= 0 ? 1 : -1;
+  motors_->setDuties(sL * pwmL, sR * pwmR);
 }
 
 bool MissionController::processQueue(unsigned long nowMs) {
@@ -292,6 +391,7 @@ bool MissionController::processQueue(unsigned long nowMs) {
 
   if (stepRunning_) {
     const MotionStep& st = queue_[queueIndex_];
+    updateEncClosedLoop(st);
     if (encoderStepDone(st) || (long)(nowMs - stepEndsAt_) >= 0) {
       motors_->stop();
       applyStepToPose(st);
@@ -305,19 +405,37 @@ bool MissionController::processQueue(unsigned long nowMs) {
 
 void MissionController::startAutoNow() {
   if (mode_ != MODE_AUTO) return;
+  if (missionActive_) return;
   missionActive_ = true;
   autoState_ = AUTO_MOVING_TO_TARGET;
   pose_ = {0, 0, HEAD_NORTH};
   odom_->resetCounts();
-  queuePathTo(constrain(autoCfg_.targetX, 0, mapSizeX_),
-              constrain(autoCfg_.targetY, 0, mapSizeY_));
+  queuePathTo(constrain(autoCfg_.xAuto, 0, mapSizeX_),
+              constrain(autoCfg_.yAuto, 0, mapSizeY_));
 }
 
-void MissionController::finishMissionAtTarget() {
+void MissionController::startReturnHome() {
+  if (mode_ != MODE_AUTO || missionActive_) return;
+  missionActive_ = true;
+  autoState_ = AUTO_RETURNING;
+  queueReturnHome();
+  queueIndex_ = 0;
+  stepRunning_ = false;
+}
+
+void MissionController::finishReachTarget(unsigned long nowMs) {
+  motors_->stop();
+  missionActive_ = false;
+  autoState_ = AUTO_AT_TARGET;
+  dwellEndsAtMs_ = nowMs + AUTO_DWELL_MS;
+}
+
+void MissionController::finishReturnHome() {
   stopAll();
   missionActive_ = false;
-  autoState_ = AUTO_FINISHED;
-  autoCfg_.enabled = false;
+  pose_ = {0, 0, HEAD_NORTH};
+  odom_->resetCounts();
+  autoState_ = (mode_ == MODE_AUTO) ? AUTO_WAITING_TIME : AUTO_FINISHED;
 }
 
 void MissionController::processManualTimeout(unsigned long nowMs) {
@@ -330,22 +448,30 @@ void MissionController::processManualTimeout(unsigned long nowMs) {
 void MissionController::processAuto(unsigned long nowMs, bool timeValid, uint32_t epoch) {
   if (mode_ != MODE_AUTO) return;
 
-  if (!autoCfg_.enabled) {
-    if (autoState_ != AUTO_DISABLED) cancelAuto();
-    return;
-  }
-
-  if (!missionActive_) {
-    if (autoCfg_.runAtEpoch == 0) {
-      startAutoNow();
-      return;
+  if (missionActive_) {
+    if (autoState_ == AUTO_MOVING_TO_TARGET || autoState_ == AUTO_RETURNING) {
+      if (processQueue(nowMs)) {
+        if (autoState_ == AUTO_MOVING_TO_TARGET) {
+          finishReachTarget(nowMs);
+        } else {
+          finishReturnHome();
+        }
+      }
     }
-    autoState_ = AUTO_WAITING_TIME;
-    if (timeValid && epoch >= autoCfg_.runAtEpoch) startAutoNow();
     return;
   }
 
-  if (autoState_ == AUTO_MOVING_TO_TARGET) {
-    if (processQueue(nowMs)) finishMissionAtTarget();
+  if (autoState_ == AUTO_AT_TARGET) {
+    if ((long)(nowMs - dwellEndsAtMs_) >= 0) startReturnHome();
+    return;
+  }
+
+  if (autoState_ == AUTO_FINISHED) return;
+
+  autoState_ = AUTO_WAITING_TIME;
+  if (autoCfg_.runAtEpoch > 0 && timeValid && epoch >= autoCfg_.runAtEpoch
+      && autoCfg_.runAtEpoch != lastTriggeredEpoch_) {
+    lastTriggeredEpoch_ = autoCfg_.runAtEpoch;
+    startAutoNow();
   }
 }
