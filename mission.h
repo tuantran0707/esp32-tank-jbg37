@@ -99,6 +99,9 @@ private:
   unsigned long stepEndsAt_;
   long stepStartEncR_;
   long stepStartEncL_;
+  long straightEncIntegral_;
+  unsigned long stepStartMs_;
+  unsigned long lastEncLoopMs_;   // khoa vong kin ve 50Hz (giong motor_test)
 
   bool missionActive_;
   int manualX_;
@@ -118,7 +121,7 @@ private:
   void queueTurnTo(Heading target);
   void queueAddForwardCm(int cm);
   bool processQueue(unsigned long nowMs);
-  bool encoderStepDone(const MotionStep& step) const;
+  bool encoderStepDone(const MotionStep& step, unsigned long nowMs) const;
   void updateEncClosedLoop(const MotionStep& step);
   static int clampMotorDuty(int duty);
   void applyStepToPose(const MotionStep& step);

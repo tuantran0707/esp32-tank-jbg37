@@ -1,5 +1,8 @@
 #include "mission.h"
 
+// Chu ky vong kin = 50Hz, giong delay(20) trong motor_test (chong dao dong)
+#define CONTROL_PERIOD_MS 20UL
+
 #ifndef STRAIGHT_STEP_TIMEOUT_MS_PER_CM
 #define STRAIGHT_STEP_TIMEOUT_MS_PER_CM 95
 #define STRAIGHT_STEP_TIMEOUT_EXTRA_MS  2000
@@ -43,6 +46,35 @@
 #define PWM_MIN_DUTY           70
 #endif
 
+#ifndef STRAIGHT_ENC_KI
+#define STRAIGHT_ENC_KI 1
+#endif
+#ifndef STRAIGHT_DRIFT_TRIM
+#define STRAIGHT_DRIFT_TRIM 0
+#endif
+#ifndef STRAIGHT_ENC_I_MAX
+#define STRAIGHT_ENC_I_MAX 600L
+#endif
+#ifndef STRAIGHT_DECEL_ZONE_PCT
+#define STRAIGHT_DECEL_ZONE_PCT 12
+#endif
+#ifndef STRAIGHT_PWM_FLOOR
+#define STRAIGHT_PWM_FLOOR 110
+#endif
+
+#ifndef TURN_ENC_KP
+#define TURN_ENC_KP 2
+#endif
+#ifndef TURN_ENC_MAX_TRIM
+#define TURN_ENC_MAX_TRIM 28
+#endif
+#ifndef TURN_CRUISE_PCT
+#define TURN_CRUISE_PCT 50
+#endif
+#ifndef TURN_MIN_RUN_MS
+#define TURN_MIN_RUN_MS 280UL
+#endif
+
 MissionController::MissionController()
     : motors_(nullptr),
       odom_(nullptr),
@@ -64,6 +96,9 @@ MissionController::MissionController()
       stepEndsAt_(0),
       stepStartEncR_(0),
       stepStartEncL_(0),
+      straightEncIntegral_(0),
+      stepStartMs_(0),
+      lastEncLoopMs_(0),
       missionActive_(false),
       manualX_(0),
       manualY_(0),
@@ -81,9 +116,9 @@ void MissionController::begin(TankMotors* motors, Odometry* odom) {
 void MissionController::setCalibration(float countsPerCm, long turn90Counts, uint32_t scan360Ms) {
   countsPerCm_ = countsPerCm;
   turn90Counts_ = turn90Counts;
-  turn90LeftCounts_ = turn90Counts;
-  turn90RightCounts_ = turn90Counts;
-  turn180Counts_ = turn90Counts * 2;
+  turn90LeftCounts_ = TURN_90_LEFT_COUNTS;
+  turn90RightCounts_ = TURN_90_RIGHT_COUNTS;
+  turn180Counts_ = TURN_180_COUNTS;
   scan360Ms_ = scan360Ms;
   if (odom_) {
     odom_->setCountsPerCm(countsPerCm_);
@@ -207,12 +242,14 @@ void MissionController::queueClear() {
 }
 
 void MissionController::queueAddTurnRight90() {
-  queuePush(TURN_PWM_LEFT, -TURN_PWM_RIGHT, turn90RightCounts_, true,
+  // Re PHAI that = banh trai LUI, banh phai TIEN (da xac minh bang thuc nghiem)
+  queuePush(-TURN_PWM_LEFT, TURN_PWM_RIGHT, turn90RightCounts_, true,
             (uint32_t)(turn90RightCounts_ * 5), 0, 0, +1);
 }
 
 void MissionController::queueAddTurnLeft90() {
-  queuePush(-TURN_PWM_LEFT, TURN_PWM_RIGHT, turn90LeftCounts_, true,
+  // Re TRAI that = banh trai TIEN, banh phai LUI
+  queuePush(TURN_PWM_LEFT, -TURN_PWM_RIGHT, turn90LeftCounts_, true,
             (uint32_t)(turn90LeftCounts_ * 5), 0, 0, -1);
 }
 
@@ -224,8 +261,9 @@ void MissionController::queueAddTurn180() {
 void MissionController::queueTurnTo(Heading target) {
   const int diff = ((int)target - (int)pose_.heading + 4) % 4;
   if (diff == 0) return;
-  if (diff == 1) queueAddTurnLeft90();
-  else if (diff == 3) queueAddTurnRight90();
+  // diff==1: heading +1 (vd N->E) = quay PHAI | diff==3: heading -1 = quay TRAI
+  if (diff == 1) queueAddTurnRight90();
+  else if (diff == 3) queueAddTurnLeft90();
   else queueAddTurn180();
 }
 
@@ -333,11 +371,12 @@ void MissionController::applyStepToPose(const MotionStep& step) {
   pose_.heading = (Heading)hd;
 }
 
-bool MissionController::encoderStepDone(const MotionStep& step) const {
+bool MissionController::encoderStepDone(const MotionStep& step, unsigned long nowMs) const {
   const long dR = odom_->getRightCount() - stepStartEncR_;
   const long dL = odom_->getLeftCount() - stepStartEncL_;
 
   if (step.isTurn) {
+    if (nowMs - stepStartMs_ < TURN_MIN_RUN_MS) return false;
     const long progress = labs((dL - dR) / 2);
     return progress >= step.encTarget;
   }
@@ -347,36 +386,80 @@ bool MissionController::encoderStepDone(const MotionStep& step) const {
   return ((fwdR + fwdL) / 2) >= step.encTarget;
 }
 
+static int turnPwmScale(long progress, long encTarget, int basePwm) {
+  const long cruiseEnd = (encTarget * TURN_CRUISE_PCT) / 100;
+  const long decelZone = max(1L, (encTarget * TURN_DECEL_ZONE_PCT) / 100);
+  const long remaining = encTarget - progress;
+
+  if (progress < cruiseEnd) return basePwm;
+
+  if (remaining <= 0 || remaining >= decelZone) return basePwm;
+
+  const int sc = (int)max((long)TURN_PWM_MIN, remaining * 100 / decelZone);
+  return max((int)TURN_PWM_MIN, basePwm * sc / 100);
+}
+
 void MissionController::updateEncClosedLoop(const MotionStep& step) {
   const long dR = odom_->getRightCount() - stepStartEncR_;
   const long dL = odom_->getLeftCount() - stepStartEncL_;
 
   if (!step.isTurn) {
-    const long err = dL - dR;
-    int corr = (int)(err * STRAIGHT_ENC_KP);
+    const long fwdR = (step.rightDuty > 0) ? max(0L, dR) : max(0L, -dR);
+    const long fwdL = (step.leftDuty > 0) ? max(0L, dL) : max(0L, -dL);
+    const long progress = (fwdR + fwdL) / 2;
+    const long err = (dL - dR) + (dR * STRAIGHT_DRIFT_TRIM) / 1000;
+
+    straightEncIntegral_ += err;
+    straightEncIntegral_ =
+        constrain(straightEncIntegral_, -STRAIGHT_ENC_I_MAX, STRAIGHT_ENC_I_MAX);
+
+    int corr = (int)(err * STRAIGHT_ENC_KP)
+             + (int)(straightEncIntegral_ * STRAIGHT_ENC_KI / 1000);
     corr = constrain(corr, -STRAIGHT_ENC_MAX_TRIM, STRAIGHT_ENC_MAX_TRIM);
-    const int newL = clampMotorDuty(step.leftDuty - corr);
-    const int newR = clampMotorDuty(step.rightDuty + corr);
+
+    static unsigned long lastStraightDbg = 0;
+    const unsigned long nowDbg = millis();
+    if (nowDbg - lastStraightDbg >= 300) {
+      lastStraightDbg = nowDbg;
+      Serial.printf("[STR] dL=%ld dR=%ld err=%ld corr=%d prog=%ld/%ld\n",
+                    dL, dR, err, corr, progress, step.encTarget);
+    }
+
+    int pwmL = abs(step.leftDuty);
+    int pwmR = abs(step.rightDuty);
+    const int sL = step.leftDuty >= 0 ? 1 : -1;
+    const int sR = step.rightDuty >= 0 ? 1 : -1;
+
+    const long decelZone =
+        max(1L, (step.encTarget * STRAIGHT_DECEL_ZONE_PCT) / 100);
+    const long remaining = step.encTarget - progress;
+    if (remaining > 0 && remaining < decelZone) {
+      const int sc = (int)max(55L, remaining * 100 / decelZone);
+      pwmL = max((int)STRAIGHT_PWM_FLOOR, pwmL * sc / 100);
+      pwmR = max((int)STRAIGHT_PWM_FLOOR, pwmR * sc / 100);
+    }
+
+    const int newL = clampMotorDuty(sL * (pwmL - corr));
+    const int newR = clampMotorDuty(sR * (pwmR + corr));
     motors_->setDuties(newL, newR);
     return;
   }
 
   const long progress = labs((dL - dR) / 2);
-  const long remaining = step.encTarget - progress;
-  if (remaining <= 0) return;
+  const long magL = labs(dL);
+  const long magR = labs(dR);
+  int corr = (int)((magL - magR) * TURN_ENC_KP);
+  corr = constrain(corr, -TURN_ENC_MAX_TRIM, TURN_ENC_MAX_TRIM);
 
-  const long decelZone = max(1L, (step.encTarget * TURN_DECEL_ZONE_PCT) / 100);
-  if (remaining > decelZone) return;
+  int pwmL = turnPwmScale(progress, step.encTarget, abs(step.leftDuty));
+  int pwmR = turnPwmScale(progress, step.encTarget, abs(step.rightDuty));
 
-  int pwmL = abs(step.leftDuty);
-  int pwmR = abs(step.rightDuty);
-  int scale = (int)((remaining * 100L) / decelZone);
-  scale = constrain(scale, 55, 100);
-  pwmL = max((int)TURN_PWM_MIN, pwmL * scale / 100);
-  pwmR = max((int)TURN_PWM_MIN, pwmR * scale / 100);
+  if (magL < magR) pwmL += corr;
+  else if (magR < magL) pwmR += corr;
+
   const int sL = step.leftDuty >= 0 ? 1 : -1;
   const int sR = step.rightDuty >= 0 ? 1 : -1;
-  motors_->setDuties(sL * pwmL, sR * pwmR);
+  motors_->setDuties(clampMotorDuty(sL * pwmL), clampMotorDuty(sR * pwmR));
 }
 
 bool MissionController::processQueue(unsigned long nowMs) {
@@ -384,6 +467,9 @@ bool MissionController::processQueue(unsigned long nowMs) {
     const MotionStep& st = queue_[queueIndex_];
     stepStartEncR_ = odom_->getRightCount();
     stepStartEncL_ = odom_->getLeftCount();
+    straightEncIntegral_ = 0;
+    stepStartMs_ = nowMs;
+    lastEncLoopMs_ = nowMs - CONTROL_PERIOD_MS;  // chay vong kin ngay lan dau
     motors_->setDuties(st.leftDuty, st.rightDuty);
     stepEndsAt_ = nowMs + st.timeoutMs;
     stepRunning_ = true;
@@ -391,8 +477,13 @@ bool MissionController::processQueue(unsigned long nowMs) {
 
   if (stepRunning_) {
     const MotionStep& st = queue_[queueIndex_];
-    updateEncClosedLoop(st);
-    if (encoderStepDone(st) || (long)(nowMs - stepEndsAt_) >= 0) {
+    // Khoa vong kin ve 50Hz (20ms) giong motor_test. Cap nhat qua nhanh
+    // (>1kHz trong loop chinh) gay dao dong corr ±60 -> xe lac, chay cham.
+    if ((long)(nowMs - lastEncLoopMs_) >= (long)CONTROL_PERIOD_MS) {
+      lastEncLoopMs_ = nowMs;
+      updateEncClosedLoop(st);
+    }
+    if (encoderStepDone(st, nowMs) || (long)(nowMs - stepEndsAt_) >= 0) {
       motors_->stop();
       applyStepToPose(st);
       queueIndex_++;

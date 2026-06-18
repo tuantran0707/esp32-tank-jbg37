@@ -37,10 +37,12 @@ int gMapSizeY = MAP_SIZE_CM;
 unsigned long gLastTelemetry = 0;
 unsigned long gLastTimeSync = 0;
 unsigned long gLastMqttAttempt = 0;
+unsigned long gLastAttrRequest = 0;
 bool gTimeValid = false;
 bool gGasAboveThreshold = false;
 int gGasThreshold = GAS_ALERT_THRESHOLD;
 bool gMqttConfigured = false;
+bool gSharedAttrReceived = false;   // da nhan shared attributes tu server chua
 
 static const unsigned long MQTT_RECONNECT_MS = 5000UL;
 
@@ -74,8 +76,30 @@ void setBuzzer(bool on) {
   digitalWrite(PIN_BUZZER, on ? HIGH : LOW);
 }
 
-void updateBuzzer(int gasRaw) {
-  setBuzzer(gasRaw > gGasThreshold);
+// Day canh bao gas len telemetry (goi khi vuot/het nguong)
+void publishGasAlert(int gasRaw, bool above) {
+  if (!gMqtt.connected()) return;
+  StaticJsonDocument<128> doc;
+  doc["gas"] = gasRaw;
+  doc["gas_threshold"] = gGasThreshold;
+  doc["gas_alert"] = above;
+  if (above) doc["status"] = "gas_alert";
+  char buf[128];
+  serializeJson(doc, buf);
+  gMqtt.publish("v1/devices/me/telemetry", buf);
+  Serial.printf("[GAS] %s gas=%d threshold=%d\n",
+                above ? "ALERT vuot nguong -> bat coi + day telemetry" : "het canh bao",
+                gasRaw, gGasThreshold);
+}
+
+// So sanh nguong: bat/tat coi + day alert len telemetry khi co thay doi trang thai
+void updateGasAlert(int gasRaw) {
+  const bool above = (gasRaw > gGasThreshold);
+  setBuzzer(above);
+  if (above != gGasAboveThreshold) {
+    gGasAboveThreshold = above;
+    publishGasAlert(gasRaw, above);
+  }
 }
 
 // -------------------------------------------------------------------
@@ -200,16 +224,16 @@ void publishTelemetry(bool force) {
   gLastTelemetry = nowMs;
 
   int gasRaw = analogRead(PIN_GAS);
-  bool gasAbove = (gasRaw > gGasThreshold);
-  gGasAboveThreshold = gasAbove;
-  updateBuzzer(gasRaw);
+  updateGasAlert(gasRaw);
 
   Pose p = gMission.pose();
   StaticJsonDocument<192> doc;
   doc["gas"] = gasRaw;
+  doc["gas_alert"] = gGasAboveThreshold;
   doc["x"] = p.x;
   doc["y"] = p.y;
   doc["mode"] = modeToText(gMission.mode());
+  doc["state"] = autoStateToText(gMission.autoState());
 
   char buf[192];
   serializeJson(doc, buf);
@@ -228,7 +252,7 @@ static bool jsonBool(JsonVariant v, bool defaultVal = false) {
   return defaultVal;
 }
 
-void applyAttributeJson(JsonVariant data) {
+void applyAttributeJson(JsonVariant data, bool fromFetch = false) {
   if (data.isNull()) {
     Serial.println("[ATTR] (null payload)");
     return;
@@ -238,7 +262,9 @@ void applyAttributeJson(JsonVariant data) {
   serializeJson(data, Serial);
   Serial.println();
 
-  if (jsonBool(data["stop"])) {
+  // 'stop' la lenh tuc thoi: chi nhan khi server day realtime, BO QUA khi tai
+  // shared attributes luc boot (tranh stop:true ton dong huy auto moi lan fetch).
+  if (!fromFetch && jsonBool(data["stop"])) {
     gMission.stopAll();
     gMission.cancelAuto();
     return;
@@ -284,6 +310,13 @@ void applyAttributeJson(JsonVariant data) {
       gMission.startManualMoveTo(targetX, targetY);
       Serial.printf("[MANUAL] (%d,%d) -> (%d,%d)\n", p.x, p.y, targetX, targetY);
     }
+  } else {  // MODE_AUTO
+    // run_auto=true: chay auto NGAY LAP TUC (khong cho run_at_epoch / gas)
+    if (jsonBool(data["run_auto"])) {
+      gMission.startAutoNow();
+      Serial.printf("[AUTO] run_auto=true -> chay ngay toi (%d,%d)\n",
+                    cfg.xAuto, cfg.yAuto);
+    }
   }
 }
 
@@ -308,15 +341,15 @@ void onMqttMessage(char* topic, byte* payload, unsigned int length) {
   }
 
   JsonVariant data = doc.as<JsonVariant>();
+  bool fromFetch = false;
   if (doc.containsKey("shared")) {
-    Serial.println("[MQTT] (goi shared attributes)");
-    data = doc["shared"];
-  }
-  if (strncmp(topic, "v1/devices/me/attributes/response/", 35) == 0) {
+    // Phan hoi cho attributes/request (goi {"shared":{...}}) -> da lay duoc config
     Serial.println("[MQTT] (phan hoi shared attributes)");
-    if (doc.containsKey("shared")) data = doc["shared"];
+    data = doc["shared"];
+    gSharedAttrReceived = true;   // ngung re-request lap lai
+    fromFetch = true;
   }
-  applyAttributeJson(data);
+  applyAttributeJson(data, fromFetch);
 }
 
 static bool gMqttSubscribed = false;
@@ -365,7 +398,7 @@ void setupMqttClient() {
   gMqtt.setServer(TB_SERVER, TB_PORT);
   gMqtt.setCallback(onMqttMessage);
   gMqtt.setKeepAlive(60);
-  gMqtt.setSocketTimeout(15);
+  gMqtt.setSocketTimeout(2);   // chan toi da 2s, tranh nghen vong kin khi dang chay
   gMqtt.setBufferSize(2048);
   gMqttConfigured = true;
 }
@@ -424,48 +457,70 @@ void setup() {
   Serial.println("=== Ready ===");
 }
 
+static AutoState gLastAutoState = AUTO_DISABLED;
+static bool gLastManualEncMove = false;
+
 void loop() {
   const unsigned long nowMs = millis();
-  const int gasRaw = analogRead(PIN_GAS);
 
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-
+  // --- 1) Mission + dieu khien motor: chay MOI vong, KHONG bao gio bo qua ---
+  // gMqtt.loop() nhe (nhan lenh stop). processQueue tick vong kin encoder.
   gMqtt.loop();
+  gMission.processManualEncMove(nowMs);
+  gMission.processAuto(nowMs, gTimeValid, nowEpoch());
+
+  // --- 2) Phat hien "da toi noi" (chay moi vong de khong bo sot) ---
+  const int gasRaw = analogRead(PIN_GAS);
+  const AutoState st = gMission.autoState();
+  if (st == AUTO_AT_TARGET && gLastAutoState == AUTO_MOVING_TO_TARGET) {
+    publishArrivedTelemetry(gasRaw);
+  }
+  if (st == AUTO_WAITING_TIME && gLastAutoState == AUTO_RETURNING) {
+    Serial.println("[AUTO] ve (0,0) xong");
+  }
+  gLastAutoState = st;
+
+  const bool manualMove = gMission.manualEncMoveActive();
+  if (gLastManualEncMove && !manualMove && gMission.mode() == MODE_MANUAL) {
+    publishArrivedTelemetry(gasRaw);
+    Serial.printf("[MANUAL] arrived (%d,%d)\n", gMission.pose().x, gMission.pose().y);
+  }
+  gLastManualEncMove = manualMove;
+
+  // --- 3) Dang di chuyen: BO QUA phan mang/telemetry gay nghen, lap lai ngay ---
+  // De vong kin encoder tick deu nhu motor_test (tranh xe chay "mu" -> lech).
+  const bool moving = manualMove
+                      || st == AUTO_MOVING_TO_TARGET
+                      || st == AUTO_RETURNING;
+  if (moving) {
+    updateGasAlert(gasRaw);
+    return;
+  }
+
+  // --- 4) Dung yen: xu ly WiFi/MQTT/telemetry (cho phep cac call co the chan) ---
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
 
   static bool wasMqttConnected = false;
   const bool mqttUp = gMqtt.connected();
   if (wasMqttConnected && !mqttUp) {
     Serial.printf("[MQTT] disconnected state=%d\n", gMqtt.state());
     gMqttSubscribed = false;
+    gSharedAttrReceived = false;   // ket noi lai -> lay lai shared attributes
   }
   wasMqttConnected = mqttUp;
 
   if (!mqttUp) connectMQTT();
 
+  // Lap lai request shared attributes den khi nhan duoc (phong truong hop rot goi)
+  if (mqttUp && !gSharedAttrReceived &&
+      (nowMs - gLastAttrRequest >= ATTR_REQUEST_INTERVAL_MS)) {
+    gLastAttrRequest = nowMs;
+    requestSharedAttributes();
+  }
+
   syncTimeNtp(false);
 
-  gMission.processManualEncMove(nowMs);
-  gMission.processAuto(nowMs, gTimeValid, nowEpoch());
-
-  static AutoState lastAutoState = AUTO_DISABLED;
-  const AutoState st = gMission.autoState();
-  if (st == AUTO_AT_TARGET && lastAutoState == AUTO_MOVING_TO_TARGET) {
-    publishArrivedTelemetry(gasRaw);
-  }
-  if (st == AUTO_WAITING_TIME && lastAutoState == AUTO_RETURNING) {
-    Serial.println("[AUTO] ve (0,0) xong");
-  }
-  lastAutoState = st;
-
-  static bool lastManualEncMove = false;
-  const bool manualMove = gMission.manualEncMoveActive();
-  if (lastManualEncMove && !manualMove && gMission.mode() == MODE_MANUAL) {
-    publishArrivedTelemetry(gasRaw);
-    Serial.printf("[MANUAL] arrived (%d,%d)\n", gMission.pose().x, gMission.pose().y);
-  }
-  lastManualEncMove = manualMove;
-
-  updateBuzzer(gasRaw);
+  updateGasAlert(gasRaw);
 
   publishTelemetry(false);
 }

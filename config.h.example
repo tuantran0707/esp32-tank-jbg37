@@ -32,27 +32,39 @@
 #define PWM_FREQ_HZ   1000  // L298N: 0.5–2 kHz (MOSFET driver TB6612 dùng ~20 kHz)
 #define PWM_RES_BITS  8
 #define PWM_MAX       255
-#define MAX_PWM_DUTY  200
+#define MAX_PWM_DUTY  235   // tran > base de vong kin con cho keo banh cham
+
+// ====== DI THANG ====== PWM 2 banh BANG NHAU, vong kin encoder tu giu thang
 #define PWM_DUTY_LEFT   200
-#define PWM_DUTY_RIGHT  160
-#define TURN_PWM_LEFT   194
-#define TURN_PWM_RIGHT  141
+#define PWM_DUTY_RIGHT  200
+#define STRAIGHT_ENC_KP        5
+#define STRAIGHT_ENC_KI        0
+#define STRAIGHT_DRIFT_TRIM  6   // phan nghin: (+)=lai TRAI, (-)=lai PHAI (bu lech co khi)
+#define STRAIGHT_ENC_I_MAX     600L
+#define STRAIGHT_ENC_MAX_TRIM  60
+#define STRAIGHT_DECEL_ZONE_PCT 12
+#define STRAIGHT_PWM_FLOOR     110
+
+// ====== XOAY ====== PWM 2 banh BANG NHAU
+#define TURN_PWM_LEFT   185
+#define TURN_PWM_RIGHT  185
 #define TURN_PWM_DUTY   TURN_PWM_LEFT
 
 #define STRAIGHT_FWD_RIGHT_TRIM  0
 #define STRAIGHT_REV_LEFT_TRIM   0
 
 #define DEFAULT_COUNTS_PER_CM  111.0f
-#define DEFAULT_TURN_90_COUNTS  601L
+#define DEFAULT_TURN_90_COUNTS  1750L
 
-#define TURN_90_LEFT_COUNTS   601L
-#define TURN_90_RIGHT_COUNTS  601L
-#define TURN_180_COUNTS       1202L
-
-#define STRAIGHT_ENC_KP        2
-#define STRAIGHT_ENC_MAX_TRIM  45
-#define TURN_PWM_MIN           85
-#define TURN_DECEL_ZONE_PCT    25
+#define TURN_90_LEFT_COUNTS   1750L
+#define TURN_90_RIGHT_COUNTS  1690L
+#define TURN_180_COUNTS       3550L
+#define TURN_ENC_KP            2
+#define TURN_ENC_MAX_TRIM      28
+#define TURN_CRUISE_PCT        50
+#define TURN_MIN_RUN_MS        280UL
+#define TURN_PWM_MIN           80
+#define TURN_DECEL_ZONE_PCT    35
 #define PWM_MIN_DUTY           70
 
 #define DEFAULT_SCAN_360_MS    1700UL
@@ -66,7 +78,7 @@
 
 #define MAP_SIZE_CM 150
 
-#define TELEMETRY_INTERVAL_MS    3000UL
+#define TELEMETRY_INTERVAL_MS    5000UL
 #define ATTR_REQUEST_INTERVAL_MS 15000UL
 #define TIME_SYNC_INTERVAL_MS    3600000UL
 #define GAS_SCAN_SAMPLE_MS       200UL
