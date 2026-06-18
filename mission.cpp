@@ -361,6 +361,10 @@ void MissionController::queueReturnHome() {
     pose_.y = 0;
   }
 
+  // Ve (0,0) xong: xoay ve dung huong ban dau (BAC) — truong hop thuong = 180 do
+  queueTurnTo(HEAD_NORTH);
+  pose_.heading = HEAD_NORTH;
+
   pose_ = saved;
 }
 
